@@ -4,6 +4,7 @@ import json
 import threading
 import secrets
 import binascii
+import time
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
@@ -17,11 +18,14 @@ NONCE_SIZE = 16
 HMAC_KEY_SIZE = 32
 MAX_FILE_SIZE = 1024 * 1024  # 1 MB for testing
 FILE_DIRECTORY = "server_files"
+DEFAULT_EXPIRATION = 60  # 60 minutes
+MAX_EXPIRATION = 4320   # 3 days in minutes
 
 USER_DB = {}
+FILE_DB = {}  # Tracks file metadata including download counts
 
 class Server:
-    def __init__(self, host='localhost', port=5001):
+    def __init__(self, host='localhost', port=5002):
         self.host = host
         self.port = port
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -35,6 +39,9 @@ class Server:
             backend=default_backend()
         )
         self.rsa_public_key = self.rsa_private_key.public_key()
+        
+        self.cleanup_thread = threading.Thread(target=self.cleanup_expired_files, daemon=True)
+        self.cleanup_thread.start()
 
     def handle_client(self, client_socket):
         try:
@@ -150,8 +157,28 @@ class Server:
             with open(file_path, 'wb') as f:
                 f.write(file_nonce + encrypted_file_data)
 
-            print(f"[SERVER] File saved with ID: {file_id}")
-            return {"status": "success", "file_id": file_id}
+            # Get max_downloads from request, default to infinity
+            max_downloads = request.get("max_downloads", float('inf'))
+            
+            # Get expiration time from request or use default
+            expiration_minutes = request.get("expiration")
+            if expiration_minutes is None:
+                expiration_minutes = DEFAULT_EXPIRATION
+            elif expiration_minutes > MAX_EXPIRATION:
+                expiration_minutes = MAX_EXPIRATION
+            
+            expiration_time = time.time() + (expiration_minutes * 60)
+            
+            # Store file metadata with expiration
+            FILE_DB[file_id] = {
+                "downloads": 0,
+                "max_downloads": max_downloads,
+                "expiration_time": expiration_time,
+                "upload_time": time.time()
+            }
+
+            print(f"[SERVER] File saved with ID: {file_id}, expires in {expiration_minutes} minutes")
+            return {"status": "success", "file_id": file_id, "expiration_minutes": expiration_minutes}
 
         except Exception as e:
             print(f"Error handling upload: {e}")
@@ -162,37 +189,76 @@ class Server:
     def handle_download(self, client_socket, request):
         try:
             file_id = request.get("file_id")
+            print(f"[SERVER] Attempting to download file: {file_id}")
+            
+            # First check - file exists in database
+            if file_id not in FILE_DB:
+                print(f"[SERVER] File {file_id} not found in database")
+                return {"status": "failed", "message": "File not found"}
+
+            file_meta = FILE_DB[file_id]
+            current_time = time.time()
+            print(f"[SERVER] File metadata: {file_meta}")
+            
+            # Second check - file hasn't expired
+            if current_time > file_meta["expiration_time"]:
+                print(f"[SERVER] File {file_id} has expired")
+                # Clean up expired file
+                file_path = os.path.join(FILE_DIRECTORY, file_id)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                del FILE_DB[file_id]
+                return {"status": "failed", "message": "File has expired"}
+
+            # Third check - download limit not reached
+            if file_meta["downloads"] >= file_meta["max_downloads"]:
+                print(f"[SERVER] File {file_id} reached download limit")
+                # Delete the file and its metadata
+                file_path = os.path.join(FILE_DIRECTORY, file_id)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                del FILE_DB[file_id]
+                return {"status": "failed", "message": "Download limit reached"}
+
             file_path = os.path.join(FILE_DIRECTORY, file_id)
-
             if not os.path.exists(file_path):
-                # Send a JSON error response if the file is not found
-                error_response = json.dumps({"status": "failed", "message": "File not found"}).encode("utf-8")
-                self.send_encrypted_response(client_socket, error_response)
-                return
+                print(f"[SERVER] File {file_id} not found on disk")
+                return {"status": "failed", "message": "File not found"}
 
-            # Step 1: Send a ready acknowledgment as a JSON response
-            ack_response = {"status": "ready"}
-            self.send_encrypted_response(client_socket, json.dumps(ack_response).encode("utf-8"))
+            # Send single ready response
+            self.send_encrypted_response(client_socket, json.dumps({"status": "ready"}).encode("utf-8"))
 
-            # Step 2: Read and send the encrypted file data (nonce + encrypted content) as stored
+            # Read the stored file data (nonce + encrypted content)
             with open(file_path, 'rb') as f:
-                file_data = f.read()  # This contains the nonce + encrypted file data
-                print("[SERVER] File content read for download (nonce + encrypted):", file_data)
+                stored_data = f.read()
+                print("[SERVER] File content read for download:", stored_data)
 
-            # Create HMAC for integrity
+            # Generate response nonce and HMAC
             response_nonce = secrets.token_bytes(NONCE_SIZE)
             h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
-            h.update(response_nonce + file_data)
+            h.update(response_nonce + stored_data)
             hmac_value = h.finalize()
 
-            # Send the file data with a length prefix
-            encrypted_response = response_nonce + file_data + hmac_value
-            file_length = len(encrypted_response).to_bytes(4, 'big')
-            client_socket.sendall(file_length + encrypted_response)
+            # Send: response_nonce + stored_data + hmac
+            response_data = response_nonce + stored_data
+            data_length = len(response_data + hmac_value).to_bytes(4, 'big')
+            client_socket.sendall(data_length + response_data + hmac_value)
             print(f"[SERVER] File with ID {file_id} successfully sent to client")
+
+            # Update download count after successful download
+            file_meta["downloads"] += 1
+            print(f"[SERVER] File {file_id} downloaded. {file_meta['max_downloads'] - file_meta['downloads']} downloads remaining")
+
+            # If max downloads reached, delete the file
+            if file_meta["downloads"] >= file_meta["max_downloads"]:
+                os.remove(file_path)
+                del FILE_DB[file_id]
+
+            return {"status": "success"}
 
         except Exception as e:
             print(f"Error handling file download: {e}")
+            return {"status": "failed", "message": str(e)}
 
 
     def authenticate_user(self, username, password):
@@ -261,6 +327,30 @@ class Server:
         plaintext = decryptor.update(ciphertext) + decryptor.finalize()
         
         return json.loads(plaintext.decode('utf-8'))
+
+    def cleanup_expired_files(self):
+        while True:
+            current_time = time.time()
+            expired_files = []
+            
+            # Check for expired files
+            for file_id, metadata in FILE_DB.items():
+                if current_time > metadata["expiration_time"]:
+                    expired_files.append(file_id)
+            
+            # Remove expired files
+            for file_id in expired_files:
+                try:
+                    file_path = os.path.join(FILE_DIRECTORY, file_id)
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    del FILE_DB[file_id]
+                    print(f"[SERVER] Removed expired file: {file_id}")
+                except Exception as e:
+                    print(f"[SERVER] Error removing expired file {file_id}: {e}")
+            
+            # Check every minute
+            time.sleep(60)
 
     def start(self):
         self.server_socket.bind((self.host, self.port))

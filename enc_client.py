@@ -13,6 +13,7 @@ AES_KEY_SIZE = 32
 NONCE_SIZE = 16
 HMAC_KEY_SIZE = 32
 MAX_FILE_SIZE = 1024 * 1024  # 1 MB limit for testing
+DEFAULT_EXPIRATION = 60  # 60 minutes
 
 class Client:
     def __init__(self, host: str = 'localhost', port: int = 5002):
@@ -104,7 +105,7 @@ class Client:
             self.is_logged_in = True  # Set login status to true
         return response
 
-    def upload_file(self, file_path):
+    def upload_file(self, file_path, max_downloads=float('inf'), expiration_minutes=None):
         if not self.is_logged_in:
             print("Please log in first.")
             return
@@ -132,78 +133,86 @@ class Client:
                 auth_tag = h.finalize()
                 print("[CLIENT] Generated HMAC:", auth_tag.hex())
 
-                # Send upload command and wait for server acknowledgment
-                command = {"command": "upload"}
-                self.send_secure_request(command)
+                # Send upload command and get response
+                command = {
+                    "command": "upload",
+                    "max_downloads": max_downloads,
+                    "expiration": expiration_minutes if expiration_minutes is not None else DEFAULT_EXPIRATION
+                }
+                upload_response = self.send_secure_request(command)
                 ack_response = self.receive_response()
-                print("Received acknowledgment from server:", ack_response)
-
+                
                 if ack_response.get("status") != "ready":
-                    print("Error: Server not ready to receive file data.")
+                    print(f"Error: Server not ready. {ack_response.get('message', '')}")
                     return
 
-                # Send the encrypted file data with nonce and HMAC tag
+                # Send file data
                 file_data_length = len(file_nonce + encrypted_file_data + auth_tag).to_bytes(4, 'big')
-                print("Sending encrypted file length and data to server...")
                 self.socket.sendall(file_data_length + file_nonce + encrypted_file_data + auth_tag)
-                print("Encrypted file data sent successfully.")
+                
+                # Get final upload response
+                final_response = self.receive_response()
+                if final_response.get("status") == "success":
+                    print(f"File uploaded successfully. ID: {final_response.get('file_id')}")
+                    print(f"File will expire in {final_response.get('expiration_minutes')} minutes")
+                    return final_response.get('file_id')
+                else:
+                    print(f"Upload failed: {final_response.get('message')}")
+                    return None
 
         except Exception as e:
             print(f"Error during file upload: {e}")
+            return None
 
 
     def download_file(self, file_id, save_path):
         try:
-            if os.path.isdir(save_path) or not os.path.splitext(save_path)[1]:
-                print("Error: save_path should include a valid file name, not just a directory.")
-                return
-
-            print(f"[CLIENT] Attempting to save file to: {save_path}")
-
-            # Send download command to the server
+            print(f"[CLIENT] Attempting to download file: {file_id}")
+            
+            # Send download request
             command = {"command": "download", "file_id": file_id}
-            self.send_secure_request(command)
-
-            # Step 1: Receive acknowledgment as JSON
-            ack_response = self.receive_response()
-            if ack_response.get("status") != "ready":
-                print("Error: Server is not ready to send file data.")
+            response = self.send_secure_request(command)
+            
+            if response.get("status") != "ready":
+                print(f"[CLIENT] Server error: {response.get('message')}")
                 return
 
-            # Step 2: Receive the file data
+            # Receive file data
             response_length = int.from_bytes(self.socket.recv(4), 'big')
             encrypted_response = self.recv_full(response_length)
+            
+            # Extract components
             response_nonce = encrypted_response[:NONCE_SIZE]
-            file_data = encrypted_response[NONCE_SIZE:-32]  # file_data = nonce + encrypted content
+            file_data = encrypted_response[NONCE_SIZE:-32]
             received_hmac = encrypted_response[-32:]
 
-            # Verify HMAC for integrity
+            # Verify HMAC
             h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
             h.update(response_nonce + file_data)
             h.verify(received_hmac)
-            print("[CLIENT] HMAC verification successful.")
+            print("[CLIENT] HMAC verification successful")
 
-            # Extract the nonce and encrypted file content from file_data
+            # Extract file nonce and encrypted content
             file_nonce = file_data[:NONCE_SIZE]
-            encrypted_file_data = file_data[NONCE_SIZE:]
+            encrypted_content = file_data[NONCE_SIZE:]
 
-            # Decrypt the file content
+            # Decrypt using original file nonce
             cipher = Cipher(algorithms.AES(self.aes_key), modes.CTR(file_nonce), backend=default_backend())
             decryptor = cipher.decryptor()
-            decrypted_file_content = decryptor.update(encrypted_file_data) + decryptor.finalize()
-            print(f"[CLIENT] Decrypted file content: {decrypted_file_content}")
+            decrypted_content = decryptor.update(encrypted_content) + decryptor.finalize()
+            
+            print(f"[CLIENT] Decrypted content: {decrypted_content}")
 
-            # Save the decrypted content to the specified file path
+            # Save decrypted file
             with open(save_path, 'wb') as f:
-                f.write(decrypted_file_content)
+                f.write(decrypted_content)
 
-            print(f"[CLIENT] File with ID {file_id} downloaded and saved to {save_path}")
+            print(f"[CLIENT] File saved to {save_path}")
+            return True
 
-        except InvalidSignature:
-            print("[CLIENT] HMAC verification failed.")
         except Exception as e:
             print(f"[CLIENT] Error downloading file: {e}")
-
+            return False
 
     def receive_response(self):
         try:
@@ -271,7 +280,11 @@ if __name__ == "__main__":
                         file_action = input("Do you want to (upload) a file, (download) a file, or (logout)? ").strip().lower()
                         if file_action == "upload":
                             file_path = input("Enter the path of the file to upload: ")
-                            client.upload_file(file_path)
+                            max_downloads = input("Enter maximum number of downloads (press Enter for unlimited): ").strip()
+                            max_downloads = float('inf') if max_downloads == "" else int(max_downloads)
+                            expiration = input("Enter expiration time in minutes (press Enter for default): ").strip()
+                            expiration = None if expiration == "" else int(expiration)
+                            client.upload_file(file_path, max_downloads, expiration)
                         elif file_action == "download":
                             file_id = input("Enter the file ID to download: ")
                             save_path = input("Enter the path to save the file: ")
