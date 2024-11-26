@@ -3,27 +3,39 @@ import os
 import json
 import secrets
 import binascii
+from google.cloud import storage
+import google.cloud.aiplatform as aiplatform
+
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
+
 AES_KEY_SIZE = 32
 NONCE_SIZE = 16
 HMAC_KEY_SIZE = 32
 MAX_FILE_SIZE = 1024 * 1024  # 1 MB limit for testing
 DEFAULT_EXPIRATION = 60  # 60 minutes
+DEFAULT_GCS_BUCKET = "client-user-storage"
 
 class Client:
-    def __init__(self, host: str = 'localhost', port: int = 5002):
+    def __init__(self, host: str = 'localhost', port: int = 5002, gcs_credentials_path: str = None):
         self.host = host
         self.port = port
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.aes_key = None
         self.hmac_key = None
-        self.is_logged_in = False  # Todo: implement sessions
-
+        self.is_logged_in = False
+        
+        # Setup Google Cloud credentials if path is provided
+        if gcs_credentials_path:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = gcs_credentials_path
+            try:
+                aiplatform.init(project="focus-ensign-437302-v1", location="us-central1")
+            except Exception as e:
+                print(f"Error initializing Vertex AI: {e}")
     def connect(self):
         try:
             self.socket.connect((self.host, self.port))
@@ -105,19 +117,17 @@ class Client:
             self.is_logged_in = True  # Set login status to true
         return response
 
-    def upload_file(self, file_path, max_downloads=float('inf'), expiration_minutes=None):
+    def upload_file(self, file_path, max_downloads=float('inf'), expiration_minutes=None, upload_to_gcs=False, gcs_bucket="client-user-storage"):
         if not self.is_logged_in:
             print("Please log in first.")
-            return
+            return None
 
         try:
             with open(file_path, 'rb') as f:
                 file_data = f.read()
                 if len(file_data) > MAX_FILE_SIZE:
                     print("Error: File too large to upload.")
-                    return
-
-                print(f"[CLIENT] Original file content before encryption: {file_data}")
+                    return None
 
                 # Encrypt the file data using AES-CTR
                 file_nonce = secrets.token_bytes(NONCE_SIZE)
@@ -125,13 +135,10 @@ class Client:
                 encryptor = cipher.encryptor()
                 encrypted_file_data = encryptor.update(file_data) + encryptor.finalize()
 
-                print("[CLIENT] Encrypted file content before sending:", encrypted_file_data)
-
                 # Generate HMAC for integrity
                 h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
                 h.update(encrypted_file_data)
                 auth_tag = h.finalize()
-                print("[CLIENT] Generated HMAC:", auth_tag.hex())
 
                 # Send upload command and get response
                 command = {
@@ -144,7 +151,7 @@ class Client:
                 
                 if ack_response.get("status") != "ready":
                     print(f"Error: Server not ready. {ack_response.get('message', '')}")
-                    return
+                    return None
 
                 # Send file data
                 file_data_length = len(file_nonce + encrypted_file_data + auth_tag).to_bytes(4, 'big')
@@ -152,13 +159,41 @@ class Client:
                 
                 # Get final upload response
                 final_response = self.receive_response()
+                file_id = None
                 if final_response.get("status") == "success":
-                    print(f"File uploaded successfully. ID: {final_response.get('file_id')}")
+                    file_id = final_response.get('file_id')
+                    print(f"File uploaded successfully. ID: {file_id}")
                     print(f"File will expire in {final_response.get('expiration_minutes')} minutes")
-                    return final_response.get('file_id')
                 else:
                     print(f"Upload failed: {final_response.get('message')}")
                     return None
+
+                # Optional GCS upload of encrypted file
+                if upload_to_gcs:
+                    try:
+                        # Create a temporary encrypted file
+                        encrypted_file_path = f"{file_path}.encrypted"
+                        with open(encrypted_file_path, 'wb') as f:
+                            f.write(file_nonce + encrypted_file_data)
+
+                        # Upload to GCS
+                        storage_client = storage.Client()
+                        bucket = storage_client.bucket(gcs_bucket)
+                        
+                        # Use file ID as blob name to ensure uniqueness
+                        blob_name = f"encrypted_files/{file_id}"
+                        blob = bucket.blob(blob_name)
+                        blob.upload_from_filename(encrypted_file_path)
+                        
+                        print(f"Encrypted file uploaded to GCS: gs://{gcs_bucket}/{blob_name}")
+                        
+                        # Optional: Remove temporary encrypted file
+                        os.remove(encrypted_file_path)
+                    
+                    except Exception as e:
+                        print(f"Error uploading to Google Cloud Storage: {e}")
+
+                return file_id
 
         except Exception as e:
             print(f"Error during file upload: {e}")
@@ -255,7 +290,7 @@ class Client:
 # Client class setup remains the same
 
 if __name__ == "__main__":
-    client = Client()
+    client = Client(gcs_credentials_path="focus-ensign-437302-v1-89352d588e13.json")
     if client.connect():
         while True:
             action = input("Do you want to (register), (login), or (exit)? ").strip().lower()
@@ -266,7 +301,6 @@ if __name__ == "__main__":
                 print(response.get("message"))
                 
                 if response.get("status") == "success":
-                    # After registering, allow for immediate login option
                     print("Registration successful. You can now login.")
                     
             elif action == "login":
@@ -284,7 +318,14 @@ if __name__ == "__main__":
                             max_downloads = float('inf') if max_downloads == "" else int(max_downloads)
                             expiration = input("Enter expiration time in minutes (press Enter for default): ").strip()
                             expiration = None if expiration == "" else int(expiration)
-                            client.upload_file(file_path, max_downloads, expiration)
+                            gcs_upload = input("Upload to Google Cloud Storage? (y/n): ").strip().lower() == 'y'
+                            
+                            client.upload_file(
+                                file_path, 
+                                max_downloads, 
+                                expiration, 
+                                upload_to_gcs=gcs_upload
+                            )
                         elif file_action == "download":
                             file_id = input("Enter the file ID to download: ")
                             save_path = input("Enter the path to save the file: ")
