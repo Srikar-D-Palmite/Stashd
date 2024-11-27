@@ -18,6 +18,7 @@ NONCE_SIZE = 16
 HMAC_KEY_SIZE = 32
 MAX_FILE_SIZE = 1024 * 1024  # 1 MB limit for testing
 DEFAULT_EXPIRATION = 60  # 60 minutes
+FILE_DIRECTORY = "client_files"
 
 class KeyStore:
     def __init__(self, username, password):
@@ -56,7 +57,9 @@ class KeyStore:
     def save_keys(self):
         # Convert to JSON-serializable format and encrypt
         encrypted = self.fernet.encrypt(json.dumps(self.keys).encode())
-        with open(self.store_path, 'wb') as f:
+        file_path = os.path.join(FILE_DIRECTORY, self.store_path)
+        os.makedirs(FILE_DIRECTORY, exist_ok=True)
+        with open(file_path, 'wb') as f:
             f.write(encrypted)
 
     def load_keys(self):
@@ -78,6 +81,11 @@ class Client:
         self.is_logged_in = False  # Todo: implement sessions
         self.keystore = None
 
+    '''
+    Connect to server using RSA.
+    Then, it switches to a Symmetric key encryption using AES for speed.
+    Can be replaced with SSL.
+    '''
     def connect(self):
         try:
             # Create new socket for each connection
@@ -92,7 +100,7 @@ class Client:
             # Receive server's RSA public key
             rsa_public_key_bytes = self.socket.recv(2480)
             try:
-                rsa_public_key = serialization.load_pem_public_key(rsa_public_key_bytes)
+                rsa_public_key = serialization.load_pem_public_key(rsa_public_key_bytes, backend=default_backend())
                 print("RSA public key loaded successfully")
             except Exception as e:
                 print(f"Failed to load RSA public key: {e}") #debugging incase of failed key exchange 
@@ -104,6 +112,7 @@ class Client:
             combined_key = self.aes_key + self.hmac_key
             
             # Encrypt combined AES+HMAC key with server's public RSA key
+            # -?? It's not using an RSA key from the client side?
             encrypted_key = rsa_public_key.encrypt(
                 combined_key,
                 padding.OAEP(
@@ -234,6 +243,7 @@ class Client:
                 return None
 
             # Send complete blob with both HMACs
+            # Should use the send_secure_request function!
             complete_blob = file_blob + transport_auth_tag
             file_data_length = len(complete_blob).to_bytes(4, 'big')
             self.socket.sendall(file_data_length + complete_blob)

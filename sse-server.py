@@ -44,6 +44,11 @@ class Server:
         self.cleanup_thread = threading.Thread(target=self.cleanup_expired_files, daemon=True)
         self.cleanup_thread.start()
 
+    '''
+    The function starts a connection with the client using RSA.
+    Then, it switches to a Symmetric key encryption using AES for speed.
+    Can be replaced with SSL.
+    '''
     def handle_client(self, client_socket):
         try:
             client_id = id(client_socket)  # Unique ID for this connection
