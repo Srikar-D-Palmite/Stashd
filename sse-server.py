@@ -44,11 +44,6 @@ class Server:
         self.cleanup_thread = threading.Thread(target=self.cleanup_expired_files, daemon=True)
         self.cleanup_thread.start()
 
-    '''
-    The function starts a connection with the client using RSA.
-    Then, it switches to a Symmetric key encryption using AES for speed.
-    Can be replaced with SSL.
-    '''
     def handle_client(self, client_socket):
         try:
             client_id = id(client_socket)  # Unique ID for this connection
@@ -63,8 +58,23 @@ class Server:
             client_socket.send(rsa_public_key_bytes)
             print("RSA public key sent successfully")
 
-            # Receive and decrypt AES + HMAC keys from client
-            encrypted_key = client_socket.recv(256)
+            # Receive client's public key
+            client_public_key_bytes = client_socket.recv(2480)
+            client_public_key = serialization.load_pem_public_key(
+                client_public_key_bytes,
+                backend=default_backend()
+            )
+
+            # Receive encrypted keys and signature
+            msg_len = int.from_bytes(client_socket.recv(4), 'big')
+            message = client_socket.recv(msg_len)
+            
+            # Split message into encrypted key and signature
+            # RSA-2048 encrypted data is 256 bytes
+            encrypted_key = message[:-256]  # Everything except last 256 bytes
+            signature = message[-256:]      # Last 256 bytes is signature
+
+            # Decrypt the symmetric keys
             combined_key = self.rsa_private_key.decrypt(
                 encrypted_key,
                 asym_padding.OAEP(
@@ -73,6 +83,23 @@ class Server:
                     label=None
                 )
             )
+
+            # Verify signature
+            try:
+                client_public_key.verify(
+                    signature,
+                    combined_key,
+                    asym_padding.PSS(
+                        mgf=asym_padding.MGF1(hashes.SHA256()),
+                        salt_length=asym_padding.PSS.MAX_LENGTH
+                    ),
+                    hashes.SHA256()
+                )
+            except InvalidSignature:
+                print("Client signature verification failed")
+                return
+
+            # Extract AES and HMAC keys
             self.aes_key, self.hmac_key = combined_key[:AES_KEY_SIZE], combined_key[AES_KEY_SIZE:]
             print("Received and decrypted AES Key: " + self.aes_key.hex())
             print("Received and decrypted HMAC Key: " + self.hmac_key.hex())

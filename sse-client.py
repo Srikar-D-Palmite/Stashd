@@ -80,6 +80,19 @@ class Client:
         self.hmac_key = None
         self.is_logged_in = False  # Todo: implement sessions
         self.keystore = None
+        self.client_private_key = None
+        self.client_public_key = None
+        self.generate_client_keys()
+
+    def generate_client_keys(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        # Generate client's RSA key pair
+        self.client_private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        self.client_public_key = self.client_private_key.public_key()
 
     '''
     Connect to server using RSA.
@@ -106,13 +119,29 @@ class Client:
                 print(f"Failed to load RSA public key: {e}") #debugging incase of failed key exchange 
                 return False
 
+            # Send client's public key to server
+            client_public_bytes = self.client_public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            self.socket.send(client_public_bytes)
+
             # Generate AES and HMAC keys
             self.aes_key = secrets.token_bytes(AES_KEY_SIZE)
             self.hmac_key = secrets.token_bytes(HMAC_KEY_SIZE)
             combined_key = self.aes_key + self.hmac_key
             
-            # Encrypt combined AES+HMAC key with server's public RSA key
-            # -?? It's not using an RSA key from the client side?
+            # Sign the combined key with client's private key
+            signature = self.client_private_key.sign(
+                combined_key,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+            
+            # Encrypt combined key with server's public key
             encrypted_key = rsa_public_key.encrypt(
                 combined_key,
                 padding.OAEP(
@@ -121,7 +150,11 @@ class Client:
                     label=None
                 )
             )
-            self.socket.send(encrypted_key) #send encrypted combined key to server
+
+            # Send encrypted key and signature
+            message = encrypted_key + signature
+            self.socket.send(len(message).to_bytes(4, 'big') + message)
+
             return True
         except Exception as e:
             print(f"Connection failed: {e}")
