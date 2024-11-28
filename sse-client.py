@@ -4,6 +4,8 @@ import json
 import secrets
 import binascii
 import base64
+import hashlib
+import json
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
@@ -19,6 +21,7 @@ HMAC_KEY_SIZE = 32
 MAX_FILE_SIZE = 1024 * 1024  # 1 MB limit for testing
 DEFAULT_EXPIRATION = 60  # 60 minutes
 FILE_DIRECTORY = "client_files"
+S_PORT = 5003
 
 class KeyStore:
     def __init__(self, username, password):
@@ -72,7 +75,7 @@ class KeyStore:
             self.keys = {}
 
 class Client:
-    def __init__(self, host: str = 'localhost', port: int = 5002):
+    def __init__(self, host: str = 'localhost', port: int = S_PORT):
         self.host = host
         self.port = port
         self.socket = None  # Don't create socket in __init__
@@ -167,7 +170,6 @@ class Client:
 
             # Generate random nonce for AES-CTR mode
             nonce = secrets.token_bytes(NONCE_SIZE)
-
             
             cipher = Cipher(algorithms.AES(self.aes_key), modes.CTR(nonce), backend=default_backend())
             encryptor = cipher.encryptor()
@@ -218,6 +220,27 @@ class Client:
             self.keystore = KeyStore(username, password)
         return response
 
+    def derive_search_token(self, keyword: str) -> str:
+        """
+        Derive a consistent but non-reversible search token
+        """
+        return base64.b64encode(
+            hashlib.sha256(
+                (keyword + "search_token").encode()
+            ).digest()
+        ).decode()
+
+    def client_encrypt(self, file_key, file_nonce, file_data):
+        cipher = Cipher(algorithms.AES(file_key), modes.CTR(file_nonce), backend=default_backend())
+        encryptor = cipher.encryptor()
+        encrypted_file_data = encryptor.update(file_data.encode('utf-8')) + encryptor.finalize()
+
+        # Tokenize into keywords. For now, a basic one.
+        keywords = set(file_data.lower().split())
+        search_tokens = [self.derive_search_token(kw) for kw in keywords]
+
+        return encrypted_file_data, search_tokens
+
     def upload_file(self, file_path, max_downloads=float('inf'), expiration_minutes=None):
         if not self.is_logged_in:
             print("Please log in first.")
@@ -229,8 +252,9 @@ class Client:
 
         try:
             # Read file and generate file-specific keys
-            with open(file_path, 'rb') as f:
-                file_data = f.read()
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+                file_data = ''.join(lines)
                 if len(file_data) > MAX_FILE_SIZE:
                     print("Error: File too large to upload.")
                     return
@@ -241,18 +265,23 @@ class Client:
             file_nonce = secrets.token_bytes(NONCE_SIZE)
 
             # Client-side encryption
-            cipher = Cipher(algorithms.AES(file_key), modes.CTR(file_nonce), backend=default_backend())
-            encryptor = cipher.encryptor()
-            encrypted_file_data = encryptor.update(file_data) + encryptor.finalize()
+            encrypted_file, search_tokens = self.client_encrypt(file_key, file_nonce, file_data)
+            # encrypted_file_data = {
+            #     "encrypted_file": encrypted_file,
+            #     "search_tokens": search_tokens
+            # }
+            # print(encrypted_file_data)
+            # serialized_data = json.dumps(encrypted_file_data).encode('utf-8')  # Encode to bytes for transmission
+            search_tokens_json = json.dumps(search_tokens).encode('utf-8')  # Encode to bytes for transmission
 
             # Structure: file_nonce + encrypted_data + file_hmac + transport_hmac
             # Generate file-level HMAC first
             file_hmac = hmac.HMAC(auth_key, hashes.SHA256(), backend=default_backend())
-            file_hmac.update(file_nonce + encrypted_file_data)
+            file_hmac.update(file_nonce + encrypted_file)
             file_auth_tag = file_hmac.finalize()
 
             # Combine file components
-            file_blob = file_nonce + encrypted_file_data + file_auth_tag
+            file_blob = file_nonce + encrypted_file + file_auth_tag
 
             # Generate transport-level HMAC
             transport_hmac = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
@@ -280,6 +309,13 @@ class Client:
             complete_blob = file_blob + transport_auth_tag
             file_data_length = len(complete_blob).to_bytes(4, 'big')
             self.socket.sendall(file_data_length + complete_blob)
+
+            # second_response = self.receive_response()
+            # if ack_response.get("status") != "ready":
+            #     print(f"Error: Server not ready. {ack_response.get('message', '')}")
+            #     return None
+            file_data_length = len(search_tokens_json).to_bytes(4, 'big')
+            self.socket.sendall(file_data_length + search_tokens_json)
                 
             # Get final upload response
             final_response = self.receive_response()
@@ -296,6 +332,25 @@ class Client:
         except Exception as e:
             print(f"Error during file upload: {e}")
             return None
+
+    def search(self, keyword: str):
+        if not self.is_logged_in:
+            print("Please log in first.")
+            return None
+
+        search_token = self.derive_search_token(keyword)
+
+        # Send upload command and get response
+        command = {
+            "command": "search",
+            "keyword": search_token,
+        }
+        search_result = self.send_secure_request(command)
+        if ("search_result" in search_result):
+            print("Files with the keyword:", search_result["search_result"])
+            return True
+        else:
+            print("error: ", search_result)
 
     def download_file(self, file_id, save_path):
         if not self.is_logged_in:
@@ -429,7 +484,7 @@ if __name__ == "__main__":
     if client.connect():
         while True:
             action = input("Do you want to (register), (login), or (exit)? ").strip().lower()
-            if action == "register":
+            if action == "register" or action=="r":
                 username = input("Enter username: ")
                 password = input("Enter password: ")
                 response = client.register(username, password)
@@ -438,7 +493,7 @@ if __name__ == "__main__":
                     print(message)
                 if response.get("status") == "success":
                     print("Registration successful. You can now login.")
-            elif action == "login":
+            elif action == "login" or action=="l":
                 username = input("Enter username: ")
                 password = input("Enter password: ")
                 response = client.login(username, password)
@@ -447,7 +502,7 @@ if __name__ == "__main__":
                 if response.get("status") == "success":
                     while True:
                         file_action = input("Do you want to (upload) a file, (download) a file, or (logout)? ").strip().lower()
-                        if file_action == "upload":
+                        if file_action == "upload" or file_action == "u":
                             file_path = input("Enter the path of the file to upload: ")
                             max_downloads = input("Enter maximum number of downloads (press Enter for unlimited): ").strip()
                             max_downloads = float('inf') if max_downloads == "" else int(max_downloads)
@@ -462,6 +517,9 @@ if __name__ == "__main__":
                             print("Logging out...")
                             client.is_logged_in = False
                             break
+                        elif file_action == "search":
+                            keyword = input("enter the keyword you want to search for: ")
+                            client.search(keyword)
                         else:
                             print("Invalid option. Choose upload, download, or logout.")
                 else:

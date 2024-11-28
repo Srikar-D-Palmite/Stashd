@@ -5,6 +5,7 @@ import threading
 import secrets
 import binascii
 import time
+import json
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.backends import default_backend
@@ -20,6 +21,7 @@ MAX_FILE_SIZE = 1024 * 1024  # 1 MB for testing
 FILE_DIRECTORY = "server_files"
 DEFAULT_EXPIRATION = 60  # 60 minutes
 MAX_EXPIRATION = 4320   # 3 days in minutes
+PORT = 5003
 
 USER_DB = {}
 FILE_DB = {}  # Tracks file metadata including download counts
@@ -32,6 +34,7 @@ class Server:
         self.aes_key = None
         self.hmac_key = None
         self.client_keys = {}  # Store keys per client connection
+        self.encrypted_index: Dict[str, List[dict]] = {}
 
         # Generate RSA key pair for server
         self.rsa_private_key = rsa.generate_private_key(
@@ -135,6 +138,8 @@ class Server:
                     response = self.handle_upload(client_socket, request)
                 elif command == "download":
                     response = self.handle_download(client_socket, request)
+                elif command == "search":
+                    response = self.handle_search(client_socket, request)
                 else:
                     response = {"status": "failed", "message": "Unknown command"}
                 
@@ -195,6 +200,18 @@ class Server:
                 print("[SERVER] Transport HMAC verification failed")
                 return {"status": "failed", "message": "Integrity check failed"}
 
+            # Extract file data
+            # received_data = json.loads(file_blob.decode('utf-8'))
+            # print(received_data)
+            # file_data = received_data["encrypted_file"]
+            # search_tokens = received_data["search_tokens"]
+            # ack_response = {"status": "ready"}
+            # self.send_encrypted_response(client_socket, json.dumps(ack_response).encode("utf-8"))
+
+            file_data_length = int.from_bytes(client_socket.recv(4), 'big')
+            search_tokens_json = self.recv_full(client_socket, file_data_length)
+            search_tokens = json.loads(search_tokens_json.decode('utf-8'))
+
             # Save the complete file blob (without transport HMAC)
             file_id = secrets.token_hex(24)
             file_path = os.path.join(FILE_DIRECTORY, file_id)
@@ -219,8 +236,18 @@ class Server:
                 "downloads": 0,
                 "max_downloads": max_downloads,
                 "expiration_time": expiration_time,
-                "upload_time": time.time()
+                "upload_time": time.time(),
+                "search_tokens": search_tokens,
             }
+            print(search_tokens)
+            for token in search_tokens:
+                if token not in self.encrypted_index:
+                    self.encrypted_index[token] = []
+                
+                # Store encrypted document with its ID
+                self.encrypted_index[token].append({
+                    'file_id': file_id,
+                })
 
             print(f"[SERVER] File saved with ID: {file_id}, expires in {expiration_minutes} minutes")
             return {"status": "success", "file_id": file_id, "expiration_minutes": expiration_minutes}
@@ -229,6 +256,15 @@ class Server:
             print(f"Error handling upload: {e}")
             return {"status": "failed", "message": "File upload failed"}
 
+    def handle_search(self, client_socket, request):
+        search_token = request.get('keyword')
+
+        # Assumes file db only has this user's files
+        search_result = self.encrypted_index.get(search_token, [])
+        
+        self.send_encrypted_response(client_socket, json.dumps({"search_result": search_result}).encode("utf-8"))
+
+        return {"status": "success"}
 
 
     def handle_download(self, client_socket, request):
@@ -424,5 +460,5 @@ class Server:
             client_thread.start()
 
 if __name__ == "__main__":
-    server = Server(port=5002)
+    server = Server(port=PORT)
     server.start()
