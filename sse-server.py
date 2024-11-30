@@ -13,6 +13,17 @@ from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_paddi
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.exceptions import InvalidSignature
+from google.cloud import storage
+from google.cloud import bigquery
+from google.oauth2 import service_account
+
+credentials = service_account.Credentials.from_service_account_file('focus-ensign-437302-v1-3627a068eafc.json')
+storage_client = storage.Client(credentials=credentials)
+bigquery_client = bigquery.Client(credentials=credentials)
+
+# Set up GCP bucket
+bucket_name = "client-user-storage"
+bucket = storage_client.bucket(bucket_name)
 
 AES_KEY_SIZE = 32
 NONCE_SIZE = 16
@@ -156,7 +167,23 @@ class Server:
 
     def register_user(self, username, password):
         print(f"Attempting to register user: {username}")
-        if username in USER_DB:
+        
+        # First, check if the username already exists in BigQuery
+        query = f"""
+        SELECT *
+        FROM `focus-ensign-437302-v1.your_dataset.users`
+        WHERE username = @username
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("username", "STRING", username)
+            ]
+        )
+        query_job = bigquery_client.query(query, job_config=job_config)
+        results = query_job.result()
+
+        # Check if user already exists
+        if next(results, None):
             print(f"Username '{username}' already exists in the database")
             return {"status": "failed", "message": "Username already exists"}
         
@@ -166,17 +193,38 @@ class Server:
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
-            iterations=100000,# The number of times hashed. Slows down brute force attacks.
+            iterations=100000,
             backend=default_backend()
         )
         password_hash = kdf.derive(password.encode())
-        USER_DB[username] = {"salt": salt, "password_hash": password_hash}
+
+        # Insert user into BigQuery
+        insert_query = f"""
+        INSERT INTO `focus-ensign-437302-v1.your_dataset.users`
+        (username, password, salt)
+        VALUES (@username, @password, @salt)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("username", "STRING", username),
+                bigquery.ScalarQueryParameter("password", "STRING", password_hash.hex()),  # Store as hex string
+                bigquery.ScalarQueryParameter("salt", "STRING", binascii.hexlify(salt).decode())  # Store salt as hex string
+            ]
+        )
         
-        print(f"User '{username}' registered successfully")
-        return {"status": "success", "message": "User registered successfully"}
+        try:
+            bigquery_client.query(insert_query, job_config=job_config).result()
+            print(f"User '{username}' registered successfully in BigQuery")
+            return {"status": "success", "message": "User registered successfully"}
+        except Exception as e:
+            print(f"Error registering user in BigQuery: {e}")
+            return {"status": "failed", "message": f"Registration failed: {str(e)}"}
 
     def handle_upload(self, client_socket, request):
         try:
+            username = request.get("username")
+            if not username:
+                return {"status": "failed", "message": "Username not provided"}
             # Send "ready" acknowledgment to the client
             ack_response = {"status": "ready"}
             self.send_encrypted_response(client_socket, json.dumps(ack_response).encode("utf-8"))
@@ -200,24 +248,40 @@ class Server:
                 print("[SERVER] Transport HMAC verification failed")
                 return {"status": "failed", "message": "Integrity check failed"}
 
-            # Extract file data
-            # received_data = json.loads(file_blob.decode('utf-8'))
-            # print(received_data)
-            # file_data = received_data["encrypted_file"]
-            # search_tokens = received_data["search_tokens"]
-            # ack_response = {"status": "ready"}
-            # self.send_encrypted_response(client_socket, json.dumps(ack_response).encode("utf-8"))
-
             file_data_length = int.from_bytes(client_socket.recv(4), 'big')
             search_tokens_json = self.recv_full(client_socket, file_data_length)
             search_tokens = json.loads(search_tokens_json.decode('utf-8'))
 
             # Save the complete file blob (without transport HMAC)
             file_id = secrets.token_hex(24)
+            # Insert file metadata into BigQuery
+            query = f"""
+            INSERT INTO `focus-ensign-437302-v1.your_dataset.file-db`
+            (username, file_id, upload_path, max_downloads, expiration_time, upload_time)
+            VALUES (@username, @file_id, @upload_path, @max_downloads, @expiration_time, @upload_time)
+            """
+
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("username", "STRING", request.get("username")),
+                    bigquery.ScalarQueryParameter("file_id", "STRING", file_id),
+                    bigquery.ScalarQueryParameter("upload_path", "STRING", f"gs://{bucket_name}/{file_id}"),
+                    bigquery.ScalarQueryParameter("max_downloads", "INTEGER", request.get("max_downloads")),
+                    bigquery.ScalarQueryParameter("expiration_time", "INTEGER", int(time.time() + request.get("expiration", DEFAULT_EXPIRATION) * 60)),
+                    bigquery.ScalarQueryParameter("upload_time", "INTEGER", int(time.time()))
+                ]
+            )
+
+            bigquery_client.query(query, job_config=job_config).result()
+
             file_path = os.path.join(FILE_DIRECTORY, file_id)
             os.makedirs(FILE_DIRECTORY, exist_ok=True)
             with open(file_path, 'wb') as f:
                 f.write(file_blob)
+                
+            #save on GCP
+            blob = bucket.blob(file_id)
+            blob.upload_from_string(file_blob)
 
             # Get max_downloads from request, default to infinity
             max_downloads = request.get("max_downloads", float('inf'))
@@ -266,102 +330,125 @@ class Server:
 
         return {"status": "success"}
 
-
     def handle_download(self, client_socket, request):
         try:
             file_id = request.get("file_id")
-            print(f"[SERVER] Attempting to download file: {file_id}")
             
-            # First check - file exists in database
-            if file_id not in FILE_DB:
-                print(f"[SERVER] File {file_id} not found in database")
-                return {"status": "failed", "message": "File not found"}
+            # Query BigQuery for file metadata
+            query = f"""
+            SELECT * FROM `focus-ensign-437302-v1.your_dataset.file-db`
+            WHERE file_id = @file_id AND expiration_time > @current_time
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("file_id", "STRING", file_id),
+                    bigquery.ScalarQueryParameter("current_time", "INTEGER", int(time.time()))
+                ]
+            )
+            query_job = bigquery_client.query(query, job_config=job_config)
+            results = list(query_job.result())
 
-            file_meta = FILE_DB[file_id]
-            current_time = time.time()
-            print(f"[SERVER] File metadata: {file_meta}")
+            if not results:
+                print(f"File not found in BigQuery: {file_id}")
+                return {"status": "failed", "message": "File not found or expired"}
+
+            file_meta = results[0]
             
-            # Second check - file hasn't expired
-            if current_time > file_meta["expiration_time"]:
-                print(f"[SERVER] File {file_id} has expired")
-                # Clean up expired file
-                file_path = os.path.join(FILE_DIRECTORY, file_id)
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                del FILE_DB[file_id]
-                return {"status": "failed", "message": "File has expired"}
-
-            # Third check - download limit not reached
-            if file_meta["downloads"] >= file_meta["max_downloads"]:
-                print(f"[SERVER] File {file_id} reached download limit")
-                # Delete the file and its metadata
-                file_path = os.path.join(FILE_DIRECTORY, file_id)
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                del FILE_DB[file_id]
-                return {"status": "failed", "message": "Download limit reached"}
-
-            file_path = os.path.join(FILE_DIRECTORY, file_id)
-            if not os.path.exists(file_path):
-                print(f"[SERVER] File {file_id} not found on disk")
-                return {"status": "failed", "message": "File not found"}
-
-            # Send single ready response
             self.send_encrypted_response(client_socket, json.dumps({"status": "ready"}).encode("utf-8"))
-
-            # Read the stored file data (nonce + encrypted content)
-            with open(file_path, 'rb') as f:
-                stored_data = f.read()
-                print("[SERVER] File content read for download:", stored_data)
-
+            # Download file from GCS bucket
+            blob = bucket.blob(file_id)
+            file_data = blob.download_as_string()
             # Add transport-level HMAC
             transport_hmac = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
-            transport_hmac.update(stored_data)
+            transport_hmac.update(file_data)
             transport_tag = transport_hmac.finalize()
 
             # Send complete blob with transport HMAC
-            complete_data = stored_data + transport_tag
+            complete_data = file_data + transport_tag
             data_length = len(complete_data).to_bytes(4, 'big')
             client_socket.sendall(data_length + complete_data)
 
             print(f"[SERVER] Sent file {file_id} with transport integrity")
 
-            # Update download count after successful download
-            file_meta["downloads"] += 1
-            print(f"[SERVER] File {file_id} downloaded. {file_meta['max_downloads'] - file_meta['downloads']} downloads remaining")
-
-            # If max downloads reached, delete the file
-            if file_meta["downloads"] >= file_meta["max_downloads"]:
-                os.remove(file_path)
-                del FILE_DB[file_id]
-
+            update_query = f"""
+            UPDATE `focus-ensign-437302-v1.your_dataset.file-db`
+            SET downloads = downloads + 1
+            WHERE file_id = @file_id
+            """
+            update_job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("file_id", "STRING", file_id)
+                ]
+            )
+            bigquery_client.query(update_query, job_config=update_job_config).result()
             return {"status": "success"}
-
         except Exception as e:
-            print(f"Error handling file download: {e}")
+            print(f"Error handling download: {e}")
+            return {"status": "failed", "message": str(e)}
+    def upload_file(self, file_data, max_downloads, expiration_minutes):
+        try:
+            file_id = secrets.token_hex(24)
+            expiration_time = int(time.time() + (expiration_minutes * 60))
+
+            # Upload file to GCP bucket
+            try:
+                blob = bucket.blob(file_id)
+                blob.upload_from_string(file_data)
+                print(f"File uploaded successfully to GCS with file_id: {file_id}")
+            except Exception as gcs_error:
+                print(f"Error uploading to GCS: {gcs_error}")
+                return {"status": "failed", "message": f"GCS upload failed: {str(gcs_error)}"}
+
+            # Set metadata
+            blob.metadata = {
+                "max_downloads": str(max_downloads),
+                "expiration_time": str(expiration_time),
+                "download_count": "0"
+            }
+            blob.patch()
+
+            return {"status": "success", "file_id": file_id, "expiration_minutes": expiration_minutes}
+        except Exception as e:
+            print(f"Error uploading file: {e}")
             return {"status": "failed", "message": str(e)}
 
-
     def authenticate_user(self, username, password):
-        user_record = USER_DB.get(username)
+        query = f"""
+        SELECT *
+        FROM `focus-ensign-437302-v1.your_dataset.users`
+        WHERE username = @username
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("username", "STRING", username)
+            ]
+        )
+        query_job = bigquery_client.query(query, job_config=job_config)
+        results = query_job.result()
+
+        user_record = next(results, None)
         if not user_record:
             return {"status": "failed", "message": "User does not exist"}
-        
-        # Hash the provided password with the stored salt
-        salt = user_record["salt"]
+
+        # Verify password
+        stored_salt = binascii.unhexlify(user_record['salt'])
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=salt,
+            salt=stored_salt,
             iterations=100000,
             backend=default_backend()
         )
-        try:
-            kdf.verify(password.encode(), user_record["password_hash"])
+        
+        # Hash the provided password with the stored salt
+        password_hash = kdf.derive(password.encode())
+        
+        # Compare hashed passwords
+        if password_hash.hex() == user_record['password']:
             return {"status": "success", "message": "Login successful"}
-        except Exception:
+        else:
             return {"status": "failed", "message": "Incorrect password"}
-
+            
     def send_encrypted_response(self, client_socket, data):
         client_id = id(client_socket)
         client_keys = self.client_keys.get(client_id)
