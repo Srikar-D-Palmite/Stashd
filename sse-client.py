@@ -217,7 +217,6 @@ class Client:
         response = self.send_secure_request({"command": "login", "username": username, "password": password})
         if response.get("status") == "success":
             self.is_logged_in = True
-            self.username = username
             self.keystore = KeyStore(username, password)
         return response
 
@@ -292,7 +291,6 @@ class Client:
             # Send upload command and get response
             command = {
                 "command": "upload",
-                "username": self.username,
                 "max_downloads": max_downloads,
                 "expiration": expiration_minutes if expiration_minutes is not None else DEFAULT_EXPIRATION
             }
@@ -324,11 +322,11 @@ class Client:
             if final_response.get("status") == "success":
                 file_id = final_response.get('file_id')
                 self.keystore.add_keys(file_id, file_key, auth_key)
-                print(f"File uploaded successfully to GCP. ID: {file_id}")
+                print(f"File uploaded successfully. ID: {final_response.get('file_id')}")
                 print(f"File will expire in {final_response.get('expiration_minutes')} minutes")
-                return file_id
+                return final_response.get('file_id')
             else:
-                print(f"Upload to GCP failed: {final_response.get('message')}")
+                print(f"Upload failed: {final_response.get('message')}")
                 return None
 
         except Exception as e:
@@ -359,6 +357,7 @@ class Client:
             print("Please log in first.")
             return False
 
+        # Get file keys from keystore
         keys = self.keystore.get_keys(file_id)
         if not keys:
             print("No encryption keys found for this file.")
@@ -368,19 +367,23 @@ class Client:
 
         try:
             print(f"[CLIENT] Attempting to download file: {file_id}")
+            
+            # Send download request
             command = {"command": "download", "file_id": file_id}
             response = self.send_secure_request(command)
-
+            
             if response.get("status") != "ready":
-                print(f"[CLIENT] GCP server error: {response.get('message')}")
-                return False
+                print(f"[CLIENT] Server error: {response.get('message')}")
+                return
 
+            # Receive file data
             response_length = int.from_bytes(self.socket.recv(4), 'big')
             encrypted_response = self.recv_full(response_length)
-
+            
+            # Verify transport-level HMAC first
             transport_hmac = encrypted_response[-32:]
             encrypted_blob = encrypted_response[:-32]
-
+            
             h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
             h.update(encrypted_blob)
             try:
@@ -390,6 +393,7 @@ class Client:
                 print("[CLIENT] Transport integrity check failed")
                 return False
 
+            # Now handle the file-level data
             if len(encrypted_blob) < NONCE_SIZE + 32:
                 print("[CLIENT] File data too small")
                 return False
@@ -398,6 +402,9 @@ class Client:
             encrypted_content = encrypted_blob[NONCE_SIZE:-32]
             file_hmac = encrypted_blob[-32:]
 
+            print(f"[CLIENT] Data sizes - Nonce: {len(file_nonce)}, Content: {len(encrypted_content)}, HMAC: {len(file_hmac)}")
+
+            # Verify file-level HMAC
             h = hmac.HMAC(auth_key, hashes.SHA256(), backend=default_backend())
             h.update(file_nonce + encrypted_content)
             try:
@@ -407,18 +414,24 @@ class Client:
                 print("[CLIENT] File integrity check failed")
                 return False
 
-            cipher = Cipher(algorithms.AES(file_key), modes.CTR(file_nonce), backend=default_backend())
-            decryptor = cipher.decryptor()
-            decrypted_content = decryptor.update(encrypted_content) + decryptor.finalize()
+            # If we get here, both transport and file integrity verified
+            try:
+                cipher = Cipher(algorithms.AES(file_key), modes.CTR(file_nonce), backend=default_backend())
+                decryptor = cipher.decryptor()
+                decrypted_content = decryptor.update(encrypted_content) + decryptor.finalize()
 
-            with open(save_path, 'wb') as f:
-                f.write(decrypted_content)
+                with open(save_path, 'wb') as f:
+                    f.write(decrypted_content)
 
-            print(f"[CLIENT] File saved to {save_path}")
-            return True
+                print(f"[CLIENT] File saved to {save_path}")
+                return True
+
+            except Exception as e:
+                print(f"[CLIENT] Decryption error: {str(e)}")
+                return False
 
         except Exception as e:
-            print(f"[CLIENT] Error downloading file from GCP: {e}")
+            print(f"[CLIENT] Error downloading file: {e}")
             return False
 
     def receive_response(self):
@@ -464,7 +477,28 @@ class Client:
             data += part
         return data
 
-# Client class setup remains the same
+    def list_files(self):
+        if not self.is_logged_in:
+            print("Please log in first.")
+            return None
+            
+        response = self.send_secure_request({"command": "list_files"})
+        if response.get("status") == "success":
+            files = response.get("files", [])
+            if not files:
+                print("No files available for download.")
+            else:
+                print("\nAvailable files:")
+                print("-" * 50)
+                for file in files:
+                    print(f"File ID: {file['file_id']}")
+                    print(f"Downloads remaining: {'unlimited' if file['downloads_remaining'] == float('inf') else file['downloads_remaining']}")
+                    print(f"Expires in: {file['expires_in_minutes']} minutes")
+                    print("-" * 50)
+            return files
+        else:
+            print(f"Error listing files: {response.get('message')}")
+            return None
 
 if __name__ == "__main__":
     client = Client()
@@ -488,7 +522,7 @@ if __name__ == "__main__":
 
                 if response.get("status") == "success":
                     while True:
-                        file_action = input("Do you want to (upload) a file, (download) a file, or (logout)? ").strip().lower()
+                        file_action = input("Do you want to (upload) a file, (list) files, (download) a file, (search) for files, or (logout)? ").strip().lower()
                         if file_action == "upload" or file_action == "u":
                             file_path = input("Enter the path of the file to upload: ")
                             max_downloads = input("Enter maximum number of downloads (press Enter for unlimited): ").strip()
@@ -496,7 +530,10 @@ if __name__ == "__main__":
                             expiration = input("Enter expiration time in minutes (press Enter for default): ").strip()
                             expiration = None if expiration == "" else int(expiration)
                             client.upload_file(file_path, max_downloads, expiration)
-                        elif file_action == "download":
+                        elif file_action == "list" or file_action == "l":
+                            client.list_files()
+                        elif file_action == "download" or file_action == "d":
+                            client.list_files()  # Show available files first
                             file_id = input("Enter the file ID to download: ")
                             save_path = input("Enter the path to save the file: ")
                             client.download_file(file_id, save_path)
