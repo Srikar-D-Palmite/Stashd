@@ -266,12 +266,6 @@ class Client:
 
             # Client-side encryption
             encrypted_file, search_tokens = self.client_encrypt(file_key, file_nonce, file_data)
-            # encrypted_file_data = {
-            #     "encrypted_file": encrypted_file,
-            #     "search_tokens": search_tokens
-            # }
-            # print(encrypted_file_data)
-            # serialized_data = json.dumps(encrypted_file_data).encode('utf-8')  # Encode to bytes for transmission
             search_tokens_json = json.dumps(search_tokens).encode('utf-8')  # Encode to bytes for transmission
 
             # Structure: file_nonce + encrypted_data + file_hmac + transport_hmac
@@ -291,6 +285,7 @@ class Client:
             # Send upload command and get response
             command = {
                 "command": "upload",
+                # "username": self.username,
                 "max_downloads": max_downloads,
                 "expiration": expiration_minutes if expiration_minutes is not None else DEFAULT_EXPIRATION
             }
@@ -304,16 +299,13 @@ class Client:
                 print(f"Error: Server not ready. {ack_response.get('message', '')}")
                 return None
 
-            # Send complete blob with both HMACs
+            # Send complete file with both HMACs
             # Should use the send_secure_request function!
             complete_blob = file_blob + transport_auth_tag
             file_data_length = len(complete_blob).to_bytes(4, 'big')
             self.socket.sendall(file_data_length + complete_blob)
 
-            # second_response = self.receive_response()
-            # if ack_response.get("status") != "ready":
-            #     print(f"Error: Server not ready. {ack_response.get('message', '')}")
-            #     return None
+            # Send search tokens.
             file_data_length = len(search_tokens_json).to_bytes(4, 'big')
             self.socket.sendall(file_data_length + search_tokens_json)
                 
@@ -322,11 +314,11 @@ class Client:
             if final_response.get("status") == "success":
                 file_id = final_response.get('file_id')
                 self.keystore.add_keys(file_id, file_key, auth_key)
-                print(f"File uploaded successfully. ID: {final_response.get('file_id')}")
+                print(f"File uploaded successfully to GCP. ID: {file_id}")
                 print(f"File will expire in {final_response.get('expiration_minutes')} minutes")
-                return final_response.get('file_id')
+                return file_id
             else:
-                print(f"Upload failed: {final_response.get('message')}")
+                print(f"Upload to GCP failed: {final_response.get('message')}")
                 return None
 
         except Exception as e:
@@ -371,10 +363,10 @@ class Client:
             # Send download request
             command = {"command": "download", "file_id": file_id}
             response = self.send_secure_request(command)
-            
+
             if response.get("status") != "ready":
-                print(f"[CLIENT] Server error: {response.get('message')}")
-                return
+                print(f"[CLIENT] GCP server error: {response.get('message')}")
+                return False
 
             # Receive file data
             response_length = int.from_bytes(self.socket.recv(4), 'big')
@@ -383,7 +375,7 @@ class Client:
             # Verify transport-level HMAC first
             transport_hmac = encrypted_response[-32:]
             encrypted_blob = encrypted_response[:-32]
-            
+
             h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
             h.update(encrypted_blob)
             try:
@@ -402,7 +394,7 @@ class Client:
             encrypted_content = encrypted_blob[NONCE_SIZE:-32]
             file_hmac = encrypted_blob[-32:]
 
-            print(f"[CLIENT] Data sizes - Nonce: {len(file_nonce)}, Content: {len(encrypted_content)}, HMAC: {len(file_hmac)}")
+            # print(f"[CLIENT] Data sizes - Nonce: {len(file_nonce)}, Content: {len(encrypted_content)}, HMAC: {len(file_hmac)}")
 
             # Verify file-level HMAC
             h = hmac.HMAC(auth_key, hashes.SHA256(), backend=default_backend())
@@ -414,24 +406,18 @@ class Client:
                 print("[CLIENT] File integrity check failed")
                 return False
 
-            # If we get here, both transport and file integrity verified
-            try:
-                cipher = Cipher(algorithms.AES(file_key), modes.CTR(file_nonce), backend=default_backend())
-                decryptor = cipher.decryptor()
-                decrypted_content = decryptor.update(encrypted_content) + decryptor.finalize()
+            cipher = Cipher(algorithms.AES(file_key), modes.CTR(file_nonce), backend=default_backend())
+            decryptor = cipher.decryptor()
+            decrypted_content = decryptor.update(encrypted_content) + decryptor.finalize()
 
-                with open(save_path, 'wb') as f:
-                    f.write(decrypted_content)
+            with open(save_path, 'wb') as f:
+                f.write(decrypted_content)
 
-                print(f"[CLIENT] File saved to {save_path}")
-                return True
-
-            except Exception as e:
-                print(f"[CLIENT] Decryption error: {str(e)}")
-                return False
+            print(f"[CLIENT] File saved to {save_path}")
+            return True
 
         except Exception as e:
-            print(f"[CLIENT] Error downloading file: {e}")
+            print(f"[CLIENT] Error downloading file from GCP: {e}")
             return False
 
     def receive_response(self):
@@ -522,7 +508,7 @@ if __name__ == "__main__":
 
                 if response.get("status") == "success":
                     while True:
-                        file_action = input("Do you want to (upload) a file, (list) files, (download) a file, (search) for files, or (logout)? ").strip().lower()
+                        file_action = input("Do you want to (upload) a file, (download) a file, (list) files, (search) files for a keyword, or (logout)? ").strip().lower()
                         if file_action == "upload" or file_action == "u":
                             file_path = input("Enter the path of the file to upload: ")
                             max_downloads = input("Enter maximum number of downloads (press Enter for unlimited): ").strip()
@@ -530,28 +516,28 @@ if __name__ == "__main__":
                             expiration = input("Enter expiration time in minutes (press Enter for default): ").strip()
                             expiration = None if expiration == "" else int(expiration)
                             client.upload_file(file_path, max_downloads, expiration)
-                        elif file_action == "list" or file_action == "l":
+                        elif file_action == "list" or file_action == "ls":
                             client.list_files()
                         elif file_action == "download" or file_action == "d":
                             client.list_files()  # Show available files first
                             file_id = input("Enter the file ID to download: ")
                             save_path = input("Enter the path to save the file: ")
                             client.download_file(file_id, save_path)
-                        elif file_action == "logout":
+                        elif file_action == "search" or file_action == "s":
+                            keyword = input("Enter the keyword you want to search for: ")
+                            client.search(keyword)
+                        elif file_action == "logout" or file_action == "lo":
                             print("Logging out...")
                             client.is_logged_in = False
                             break
-                        elif file_action == "search":
-                            keyword = input("enter the keyword you want to search for: ")
-                            client.search(keyword)
                         else:
-                            print("Invalid option. Choose upload, download, or logout.")
+                            print("Invalid option. Please choose among 'upload', 'download', 'search', 'list' or 'logout':")
                 else:
                     print("Invalid login details.")
             elif action == "exit":
                 print("Exiting client.")
                 break
             else:
-                print("Invalid choice. Please choose either 'register', 'login', or 'exit'.")
+                print("Invalid option. Please choose among 'register', 'login', or 'exit':")
         
         client.close()

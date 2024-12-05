@@ -265,9 +265,9 @@ class Server:
         # Assumes file db only has this user's files
         search_result = self.encrypted_index.get(search_token, [])
         
-        self.send_encrypted_response(client_socket, json.dumps({"search_result": search_result}).encode("utf-8"))
+        # self.send_encrypted_response(client_socket, json.dumps().encode("utf-8"))
 
-        return {"status": "success"}
+        return {"status": "success", "search_result": search_result}
 
 
     def handle_download(self, client_socket, request):
