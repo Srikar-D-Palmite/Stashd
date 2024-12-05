@@ -6,6 +6,7 @@ import secrets
 import binascii
 import time
 import json
+import traceback
 from typing import Dict, List
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes, hmac
@@ -26,6 +27,7 @@ PORT = 5003
 
 USER_DB = {}
 FILE_DB = {}  # Tracks file metadata including download counts
+PUBLIC_FILE_DB = {}  # Separate database for public files
 
 class Server:
     def __init__(self, host='localhost', port=5002):
@@ -47,6 +49,9 @@ class Server:
         
         self.cleanup_thread = threading.Thread(target=self.cleanup_expired_files, daemon=True)
         self.cleanup_thread.start()
+        self.sessions = {}  # Add session tracking
+        self.user_files = {}  # Track files per user
+        self.public_files = set()  # Track public file IDs
 
     def handle_client(self, client_socket):
         try:
@@ -126,15 +131,20 @@ class Server:
                 
                 request = self.decrypt_and_verify(encrypted_data)
                 print(f"Decrypted Request: {request}")
-                command = request.get("command")
+                command = request.get("command", "")  # Default to empty string if no command
                 print(f"Received Command: {command}")
 
+                # Handle empty requests (used during file upload)
+                if not command and not request:
+                    continue
+
+                response = {"status": "failed", "message": "Unknown command"}
                 if command == "register":
                     response = self.register_user(request["username"], request["password"])
                 elif command == "login":
                     response = self.authenticate_user(request["username"], request["password"])
                 elif command == "list_files":
-                    response = self.list_files()
+                    response = self.list_files(request)
                 elif command == "upload":
                     ack_response = {"status": "ready"}
                     self.send_encrypted_response(client_socket, json.dumps(ack_response).encode("utf-8"))
@@ -143,8 +153,6 @@ class Server:
                     response = self.handle_download(client_socket, request)
                 elif command == "search":
                     response = self.handle_search(client_socket, request)
-                else:
-                    response = {"status": "failed", "message": "Unknown command"}
                 
                 response_data = json.dumps(response).encode('utf-8')
                 self.send_encrypted_response(client_socket, response_data)
@@ -180,17 +188,39 @@ class Server:
 
     def handle_upload(self, client_socket, request):
         try:
-            # Send "ready" acknowledgment to the client
+            # Get session info
+            session_id = request.get('session_id')
+            is_public = request.get('is_public', False)  # Get public flag
+            
+            if not is_public and (not session_id or session_id not in self.sessions):
+                print("[SERVER] Invalid session")
+                return {"status": "failed", "message": "Invalid session"}
+            
+            username = self.sessions[session_id]['username'] if session_id else "anonymous"
+            print(f"[SERVER] Handling upload for user: {username}")
+            
+            # Send "ready" acknowledgment
             ack_response = {"status": "ready"}
             self.send_encrypted_response(client_socket, json.dumps(ack_response).encode("utf-8"))
+            print("[SERVER] Sent ready acknowledgment")
 
             # Receive the file data length and content
-            file_data_length = int.from_bytes(client_socket.recv(4), 'big')
-            file_data = self.recv_full(client_socket, file_data_length)
+            try:
+                file_data_length = int.from_bytes(client_socket.recv(4), 'big')
+                print(f"[SERVER] Expected file data length: {file_data_length} bytes")
+                
+                if file_data_length > MAX_FILE_SIZE:
+                    print(f"[SERVER] File too large: {file_data_length} bytes")
+                    return {"status": "failed", "message": "File too large"}
+                    
+                file_data = self.recv_full(client_socket, file_data_length)
+                print(f"[SERVER] Received file data: {len(file_data)} bytes")
+            except Exception as e:
+                print(f"[SERVER] Error receiving file data: {e}")
+                return {"status": "failed", "message": "Error receiving file"}
 
-            # Structure: file_blob + transport_hmac
-            # where file_blob = file_nonce + encrypted_data + file_hmac
-            file_blob = file_data[:-32]  # Everything except transport HMAC
+            # Split off transport HMAC
+            file_blob = file_data[:-32]
             transport_hmac = file_data[-32:]
 
             # Verify transport HMAC
@@ -203,72 +233,98 @@ class Server:
                 print("[SERVER] Transport HMAC verification failed")
                 return {"status": "failed", "message": "Integrity check failed"}
 
-            # Extract file data
-            # received_data = json.loads(file_blob.decode('utf-8'))
-            # print(received_data)
-            # file_data = received_data["encrypted_file"]
-            # search_tokens = received_data["search_tokens"]
-            # ack_response = {"status": "ready"}
-            # self.send_encrypted_response(client_socket, json.dumps(ack_response).encode("utf-8"))
-
-            file_data_length = int.from_bytes(client_socket.recv(4), 'big')
-            search_tokens_json = self.recv_full(client_socket, file_data_length)
+            # Receive search tokens
+            tokens_length = int.from_bytes(client_socket.recv(4), 'big')
+            search_tokens_json = self.recv_full(client_socket, tokens_length)
             search_tokens = json.loads(search_tokens_json.decode('utf-8'))
 
-            # Save the complete file blob (without transport HMAC)
+            # Generate file ID and save file
             file_id = secrets.token_hex(24)
             file_path = os.path.join(FILE_DIRECTORY, file_id)
             os.makedirs(FILE_DIRECTORY, exist_ok=True)
             with open(file_path, 'wb') as f:
                 f.write(file_blob)
 
-            # Get max_downloads from request, default to infinity
+            # Update metadata
             max_downloads = request.get("max_downloads", float('inf'))
-            
-            # Get expiration time from request or use default
-            expiration_minutes = request.get("expiration")
-            if expiration_minutes is None:
-                expiration_minutes = DEFAULT_EXPIRATION
-            elif expiration_minutes > MAX_EXPIRATION:
-                expiration_minutes = MAX_EXPIRATION
+            expiration_minutes = min(
+                request.get("expiration", DEFAULT_EXPIRATION),
+                MAX_EXPIRATION
+            )
             
             expiration_time = time.time() + (expiration_minutes * 60)
             
-            # Store file metadata with expiration
             FILE_DB[file_id] = {
                 "downloads": 0,
                 "max_downloads": max_downloads,
                 "expiration_time": expiration_time,
                 "upload_time": time.time(),
                 "search_tokens": search_tokens,
+                "owner": username
             }
-            print(search_tokens)
+            
+            if username not in self.user_files:
+                self.user_files[username] = set()
+            self.user_files[username].add(file_id)
+
+            # Update search index
             for token in search_tokens:
                 if token not in self.encrypted_index:
                     self.encrypted_index[token] = []
-                
-                # Store encrypted document with its ID
-                self.encrypted_index[token].append({
-                    'file_id': file_id,
-                })
+                self.encrypted_index[token].append({'file_id': file_id})
 
-            print(f"[SERVER] File saved with ID: {file_id}, expires in {expiration_minutes} minutes")
-            return {"status": "success", "file_id": file_id, "expiration_minutes": expiration_minutes}
+            # After generating file_id and saving file, add public tracking
+            if is_public:
+                self.public_files.add(file_id)
+                PUBLIC_FILE_DB[file_id] = FILE_DB[file_id]
+
+            return {
+                "status": "success",
+                "file_id": file_id,
+                "expiration_minutes": expiration_minutes,
+                "is_public": is_public
+            }
 
         except Exception as e:
-            print(f"Error handling upload: {e}")
-            return {"status": "failed", "message": "File upload failed"}
+            print(f"[SERVER] Error handling upload: {e}")
+            traceback.print_exc()  # Add this for detailed error information
+            return {"status": "failed", "message": str(e)}
 
     def handle_search(self, client_socket, request):
+        session_id = request.get('session_id')
         search_token = request.get('keyword')
-
-        # Assumes file db only has this user's files
-        search_result = self.encrypted_index.get(search_token, [])
         
-        # self.send_encrypted_response(client_socket, json.dumps().encode("utf-8"))
-
-        return {"status": "success", "search_result": search_result}
-
+        # Get search results
+        search_results = []
+        matched_files = self.encrypted_index.get(search_token, [])
+        
+        current_time = time.time()
+        for file_data in matched_files:
+            file_id = file_data['file_id']
+            if file_id in FILE_DB:
+                metadata = FILE_DB[file_id]
+                # Only include files that haven't expired and have downloads remaining
+                if current_time <= metadata["expiration_time"] and metadata["downloads"] < metadata["max_downloads"]:
+                    # For logged in users, show their private files and all public files
+                    if session_id and session_id in self.sessions:
+                        username = self.sessions[session_id]['username']
+                        if metadata['owner'] == username or file_id in self.public_files:
+                            search_results.append({
+                                'file_id': file_id,
+                                'downloads_remaining': metadata["max_downloads"] - metadata["downloads"],
+                                'expires_in_minutes': int((metadata["expiration_time"] - current_time) / 60),
+                                'is_public': file_id in self.public_files
+                            })
+                    # For anonymous users, only show public files
+                    elif file_id in self.public_files:
+                        search_results.append({
+                            'file_id': file_id,
+                            'downloads_remaining': metadata["max_downloads"] - metadata["downloads"],
+                            'expires_in_minutes': int((metadata["expiration_time"] - current_time) / 60),
+                            'is_public': True
+                        })
+        
+        return {"status": "success", "search_result": search_results}
 
     def handle_download(self, client_socket, request):
         try:
@@ -361,7 +417,19 @@ class Server:
         )
         try:
             kdf.verify(password.encode(), user_record["password_hash"])
-            return {"status": "success", "message": "Login successful"}
+            
+            # Create session
+            session_id = secrets.token_hex(16)
+            self.sessions[session_id] = {
+                'username': username,
+                'created_at': time.time()
+            }
+            
+            return {
+                "status": "success", 
+                "message": "Login successful",
+                "session_id": session_id
+            }
         except Exception:
             return {"status": "failed", "message": "Incorrect password"}
 
@@ -451,12 +519,34 @@ class Server:
             # Check every minute
             time.sleep(60)
 
-    def list_files(self):
+    def list_files(self, request):
+        session_id = request.get('session_id')
+        if not session_id or session_id not in self.sessions:
+            # For anonymous users, only show public files
+            current_time = time.time()
+            public_files = []
+            for file_id in self.public_files:
+                metadata = PUBLIC_FILE_DB.get(file_id)
+                if metadata and current_time <= metadata["expiration_time"]:
+                    file_info = {
+                        "file_id": file_id,
+                        "downloads_remaining": metadata["max_downloads"] - metadata["downloads"],
+                        "expires_in_minutes": int((metadata["expiration_time"] - current_time) / 60),
+                        "is_public": True
+                    }
+                    public_files.append(file_info)
+            return {"status": "success", "files": public_files}
+            
+        # For logged in users, show their files plus public files
+        username = self.sessions[session_id]['username']
         current_time = time.time()
         available_files = []
         
-        for file_id, metadata in FILE_DB.items():
-            if current_time <= metadata["expiration_time"] and metadata["downloads"] < metadata["max_downloads"]:
+        # Only list files owned by this user
+        user_file_ids = self.user_files.get(username, set())
+        for file_id in user_file_ids:
+            metadata = FILE_DB.get(file_id)
+            if metadata and current_time <= metadata["expiration_time"] and metadata["downloads"] < metadata["max_downloads"]:
                 file_info = {
                     "file_id": file_id,
                     "downloads_remaining": metadata["max_downloads"] - metadata["downloads"],
