@@ -344,7 +344,7 @@ class Client:
             if upload_response.get("status") != "ready":
                 print(f"[CLIENT] Server not ready: {upload_response}")
                 return None
-
+                
             # Send complete blob with both HMACs
             try:
                 complete_blob = file_blob + transport_auth_tag
@@ -431,8 +431,8 @@ class Client:
             response = self.send_secure_request(command)
             
             if response.get("status") != "ready":
-                print(f"[CLIENT] Server error: {response.get('message')}")
-                return
+                print(f"[CLIENT] GCP server error: {response.get('message')}")
+                return False
 
             # Receive file data
             response_length = int.from_bytes(self.socket.recv(4), 'big')
@@ -441,7 +441,7 @@ class Client:
             # Verify transport-level HMAC first
             transport_hmac = encrypted_response[-32:]
             encrypted_blob = encrypted_response[:-32]
-            
+
             h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
             h.update(encrypted_blob)
             try:
@@ -460,7 +460,7 @@ class Client:
             encrypted_content = encrypted_blob[NONCE_SIZE:-32]
             file_hmac = encrypted_blob[-32:]
 
-            print(f"[CLIENT] Data sizes - Nonce: {len(file_nonce)}, Content: {len(encrypted_content)}, HMAC: {len(file_hmac)}")
+            # print(f"[CLIENT] Data sizes - Nonce: {len(file_nonce)}, Content: {len(encrypted_content)}, HMAC: {len(file_hmac)}")
 
             # Verify file-level HMAC
             h = hmac.HMAC(auth_key, hashes.SHA256(), backend=default_backend())
@@ -568,7 +568,7 @@ if __name__ == "__main__":
     if client.connect():
         while True:
             action = input("Do you want to (register), (login), (list) public files, or (exit)? ").strip().lower()
-            if action == "list" or action == "l":
+            if action == "list" or action == "ls":
                 client.list_files()  # Show public files for anonymous users
             elif action == "register" or action=="r":
                 username = input("Enter username: ")
@@ -587,7 +587,7 @@ if __name__ == "__main__":
 
                 if response.get("status") == "success":
                     while True:
-                        file_action = input("Do you want to (upload) a file, (list) files, (download) a file, (search) for files, or (logout)? ").strip().lower()
+                        file_action = input("Do you want to (upload) a file, (download) a file, (list) files, (search) files for a keyword, or (logout)? ").strip().lower()
                         if file_action == "upload" or file_action == "u":
                             file_path = input("Enter the path of the file to upload: ")
                             is_public = input("Make this file public? (y/n): ").strip().lower() == 'y'
@@ -596,28 +596,28 @@ if __name__ == "__main__":
                             expiration = input("Enter expiration time in minutes (press Enter for default): ").strip()
                             expiration = None if expiration == "" else int(expiration)
                             client.upload_file(file_path, max_downloads, expiration, is_public)
-                        elif file_action == "list" or file_action == "l":
+                        elif file_action == "list" or file_action == "ls":
                             client.list_files()
                         elif file_action == "download" or file_action == "d":
                             client.list_files()  # Show available files first
                             file_id = input("Enter the file ID to download: ")
                             save_path = input("Enter the path to save the file: ")
                             client.download_file(file_id, save_path)
-                        elif file_action == "logout":
+                        elif file_action == "search" or file_action == "s":
+                            keyword = input("Enter the keyword you want to search for: ")
+                            client.search(keyword)
+                        elif file_action == "logout" or file_action == "lo":
                             print("Logging out...")
                             client.is_logged_in = False
                             break
-                        elif file_action == "search":
-                            keyword = input("Enter the keyword you want to search for: ")
-                            client.search(keyword)
                         else:
-                            print("Invalid option. Choose upload, download, or logout.")
+                            print("Invalid option. Please choose among 'upload', 'download', 'search', 'list' or 'logout':")
                 else:
                     print("Invalid login details.")
             elif action == "exit":
                 print("Exiting client.")
                 break
             else:
-                print("Invalid choice. Please choose either 'register', 'login', or 'exit'.")
+                print("Invalid option. Please choose among 'register', 'login', list, or 'exit':")
         
         client.close()

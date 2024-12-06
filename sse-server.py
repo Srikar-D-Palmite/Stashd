@@ -37,6 +37,7 @@ class Server:
         self.aes_key = None
         self.hmac_key = None
         self.client_keys = {}  # Store keys per client connection
+        # Todo store in DB:
         self.encrypted_index: Dict[str, List[dict]] = {}
 
         # Generate RSA key pair for server
@@ -153,6 +154,8 @@ class Server:
                     response = self.handle_download(client_socket, request)
                 elif command == "search":
                     response = self.handle_search(client_socket, request)
+                else:
+                    response = {"status": "failed", "message": "Unknown command"}
                 
                 response_data = json.dumps(response).encode('utf-8')
                 self.send_encrypted_response(client_socket, response_data)
@@ -254,13 +257,17 @@ class Server:
             
             expiration_time = time.time() + (expiration_minutes * 60)
             
+            # Store file metadata with expiration
             FILE_DB[file_id] = {
                 "downloads": 0,
                 "max_downloads": max_downloads,
                 "expiration_time": expiration_time,
-                "upload_time": time.time(),
+                # "upload_time": time.time(),
                 "search_tokens": search_tokens,
-                "owner": username
+                "owner": username,
+                # Access logs
+                "logs": [{"operation": "upload", "datetime": time.time()}]
+            
             }
             
             if username not in self.user_files:
@@ -385,9 +392,10 @@ class Server:
 
             print(f"[SERVER] Sent file {file_id} with transport integrity")
 
-            # Update download count after successful download
+            # Update download count and add to access logs after successful download
             file_meta["downloads"] += 1
             print(f"[SERVER] File {file_id} downloaded. {file_meta['max_downloads'] - file_meta['downloads']} downloads remaining")
+            file_meta["logs"] += {"operation": "download", "datetime": time.time()}
 
             # If max downloads reached, delete the file
             if file_meta["downloads"] >= file_meta["max_downloads"]:
