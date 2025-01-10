@@ -14,7 +14,18 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.exceptions import InvalidSignature
+from google.cloud import storage
+from google.cloud import bigquery
+from google.oauth2 import service_account
+credentials = service_account.Credentials.from_service_account_file('model-marker-440302-n9-e34ab14c4039.json')
+storage_client = storage.Client(credentials=credentials)
+from google.oauth2 import service_account
+bigquery_client = bigquery.Client(credentials=credentials, project="model-marker-440302-n9")
 
+# Set up GCP bucket
+bucket_name = "client-user-storage-1"
+bucket = storage_client.bucket(bucket_name)
 AES_KEY_SIZE = 32
 NONCE_SIZE = 16
 HMAC_KEY_SIZE = 32
@@ -36,8 +47,7 @@ class KeyStore:
         self.master_key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
         self.fernet = Fernet(self.master_key)
         self.keys = {}  # file_id -> (file_key, auth_key)
-        self.username = username  # Add username for path resolution
-        self.store_path = os.path.join(FILE_DIRECTORY, f"{username}_keystore.enc")
+        self.store_path = f"{username}_keystore.enc"
         self.load_keys()
 
     def add_keys(self, file_id, file_key, auth_key):
@@ -59,31 +69,20 @@ class KeyStore:
         )
 
     def save_keys(self):
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(FILE_DIRECTORY, exist_ok=True)
-            # Convert to JSON-serializable format and encrypt
-            encrypted = self.fernet.encrypt(json.dumps(self.keys).encode())
-            with open(self.store_path, 'wb') as f:
-                f.write(encrypted)
-            print(f"[CLIENT] Saved keys to {self.store_path}")
-        except Exception as e:
-            print(f"[CLIENT] Error saving keystore: {e}")
+        # Convert to JSON-serializable format and encrypt
+        encrypted = self.fernet.encrypt(json.dumps(self.keys).encode())
+        file_path = os.path.join(FILE_DIRECTORY, self.store_path)
+        os.makedirs(FILE_DIRECTORY, exist_ok=True)
+        with open(file_path, 'wb') as f:
+            f.write(encrypted)
 
     def load_keys(self):
         try:
-            # Create directory if it doesn't exist
-            os.makedirs(FILE_DIRECTORY, exist_ok=True)
             with open(self.store_path, 'rb') as f:
                 encrypted = f.read()
                 decrypted = self.fernet.decrypt(encrypted)
                 self.keys = json.loads(decrypted.decode())
-                print(f"[CLIENT] Loaded {len(self.keys)} keys from {self.store_path}")
         except FileNotFoundError:
-            print(f"[CLIENT] No existing keystore found at {self.store_path}, creating new one")
-            self.keys = {}
-        except Exception as e:
-            print(f"[CLIENT] Error loading keystore: {e}")
             self.keys = {}
 
 class Client:
@@ -178,55 +177,59 @@ class Client:
             return False
 
     def send_secure_request(self, request: dict) -> dict:
-        # Add session ID to all requests if logged in and command is present
-        if self.is_logged_in and self.session_id and "command" in request:
-            request['session_id'] = self.session_id
         try:
             # Convert request to JSON and encrypt with AES-CTR
             plaintext = json.dumps(request).encode('utf-8')
-
             # Generate random nonce for AES-CTR mode
             nonce = secrets.token_bytes(NONCE_SIZE)
-            
             cipher = Cipher(algorithms.AES(self.aes_key), modes.CTR(nonce), backend=default_backend())
             encryptor = cipher.encryptor()
             ciphertext = encryptor.update(plaintext) + encryptor.finalize()
-            
             # Generate HMAC for integrity
             h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
             h.update(nonce + ciphertext)
-            
             hmac_value = h.finalize()
-
             # Send message with length prefix
             encrypted_request = nonce + ciphertext + hmac_value
             message_length = len(encrypted_request).to_bytes(4, 'big')
             self.socket.sendall(message_length + encrypted_request)
-
+            
             # Receive and decrypt response
             response_length = int.from_bytes(self.socket.recv(4), 'big')
             encrypted_response = self.recv_full(response_length)
+            
+            # Additional debugging print
+            print(f"[DEBUG] Received response length: {response_length}")
+            print(f"[DEBUG] Encrypted response length: {len(encrypted_response)}")
+            
             nonce = encrypted_response[:NONCE_SIZE]
             ciphertext = encrypted_response[NONCE_SIZE:-32]
             received_hmac = encrypted_response[-32:]
-
+            
             # Verify and decrypt response
             h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
             h.update(nonce + ciphertext)
             h.verify(received_hmac)
+            
             cipher = Cipher(algorithms.AES(self.aes_key), modes.CTR(nonce), backend=default_backend())
             decryptor = cipher.decryptor()
             plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            
+            # Additional debugging print
+            print(f"[DEBUG] Decrypted response: {plaintext.decode('utf-8')}")
+            
             return json.loads(plaintext.decode('utf-8'))
+        except InvalidSignature:
+            print("[CLIENT] HMAC verification failed")
+            raise
         except Exception as e:
             print(f"Error sending secure request: {e}")
-            return {"status": "failed", "message": str(e)}
+            raise  # Re-raise the exception instead of returning a dictionary
 
     def register(self, username, password):
         return self.send_secure_request({"command": "register", "username": username, "password": password})
 
     def login(self, username, password):
-        self.username = username  # Store username
         # Reconnect for new user session
         self.close()
         if not self.connect():
@@ -235,7 +238,8 @@ class Client:
         response = self.send_secure_request({"command": "login", "username": username, "password": password})
         if response.get("status") == "success":
             self.is_logged_in = True
-            self.session_id = response.get("session_id")  # Store session ID
+            self.username = username
+            self.session_id = response.get("session_id")
             self.keystore = KeyStore(username, password)
             print(f"[CLIENT] Logged in as {username}")
         return response
@@ -335,6 +339,7 @@ class Client:
             # Send upload command
             command = {
                 "command": "upload",
+                "username": self.username,
                 "max_downloads": max_downloads,
                 "expiration": expiration_minutes if expiration_minutes is not None else DEFAULT_EXPIRATION,
                 "is_public": is_public
@@ -384,37 +389,68 @@ class Client:
             return None
 
     def search(self, keyword: str):
-        search_token = self.derive_search_token(keyword)
-
-        # Send search command and get response
-        command = {
-            "command": "search",
-            "keyword": search_token,
-        }
-        search_result = self.send_secure_request(command)
-        if "search_result" in search_result:
-            if not search_result["search_result"]:
-                print("No files found matching your search.")
-                return True
-                
-            print("\nFound files:")
-            print("-" * 50)
-            for file in search_result["search_result"]:
-                print(f"File ID: {file['file_id']}")
-                print(f"Type: {'Public' if file['is_public'] else 'Private'}")
-                print(f"Downloads remaining: {'unlimited' if file['downloads_remaining'] == float('inf') else file['downloads_remaining']}")
-                print(f"Expires in: {file['expires_in_minutes']} minutes")
-                print("-" * 50)
-            return True
-        else:
-            print("Error searching:", search_result.get("message", "Unknown error"))
-            return False
-
-    def download_file(self, file_id, save_path):
         if not self.is_logged_in:
             print("Please log in first.")
             return False
 
+        search_token = self.derive_search_token(keyword)
+        command = {
+            "command": "search",
+            "keyword": search_token,
+            "username": self.username
+        }
+        search_result = self.send_secure_request(command)
+
+        if search_result.get("status") == "success":
+            results = search_result.get("search_result", [])
+            if not results:
+                print("No files found matching your search.")
+            else:
+                print("\nFound files:")
+                print("-" * 50)
+                for file in results:
+                    print(f"File ID: {file['file_id']}")
+                    print(f"Downloads remaining: {file.get('downloads_remaining', 'N/A')}")
+                    print(f"Expires in: {file.get('expires_in_minutes', 'N/A')} minutes")
+                    print("-" * 50)
+            return True
+        else:
+            print("Error searching:", search_result.get("message", "Unknown error"))
+            return False
+        
+    def list_files(self):
+        try:
+            command = {
+                "command": "list_files",
+                "username": self.username if self.is_logged_in else None
+            }
+            response = self.send_secure_request(command)
+            if response.get("status") == "success":
+                files = response.get("files", [])
+                if not files:
+                    print("No files available for download.")
+                else:
+                    print("\nAvailable files:")
+                    print("-" * 50)
+                    for file in files:
+                        print(f"File ID: {file['file_id']}")
+                        print(f"Type: {'Public' if file.get('is_public') else 'Private'}")
+                        print(f"Owner: {file.get('owner', 'Unknown')}")
+                        print(f"Downloads remaining: {'unlimited' if file['downloads_remaining'] == float('inf') else file['downloads_remaining']}")
+                        print(f"Expires in: {file['expires_in_minutes']} minutes")
+                        print("-" * 50)
+                return files
+            else:
+                print(f"Error listing files: {response.get('message', 'Unknown error')}")
+                return None
+        except Exception as e:
+            print(f"[CLIENT] Error in list_files: {e}")
+            return None 
+              
+    def download_file(self, file_id, save_path):
+        if not self.is_logged_in:
+            print("Please log in first to download files.")
+            return False
         # Get file keys from keystore
         keys = self.keystore.get_keys(file_id)
         if not keys:
@@ -422,16 +458,13 @@ class Client:
             return False
 
         file_key, auth_key = keys
-
         try:
             print(f"[CLIENT] Attempting to download file: {file_id}")
-            
-            # Send download request
-            command = {"command": "download", "file_id": file_id}
+            command = {"command": "download", "file_id": file_id, "username": self.username}
             response = self.send_secure_request(command)
-            
+
             if response.get("status") != "ready":
-                print(f"[CLIENT] GCP server error: {response.get('message')}")
+                print(f"[CLIENT] Server error: {response.get('message')}")
                 return False
 
             # Receive file data
@@ -442,6 +475,7 @@ class Client:
             transport_hmac = encrypted_response[-32:]
             encrypted_blob = encrypted_response[:-32]
 
+            # Verify transport integrity
             h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
             h.update(encrypted_blob)
             try:
@@ -492,29 +526,76 @@ class Client:
             print(f"[CLIENT] Error downloading file: {e}")
             return False
 
+    def receive_file_data(self, file_size):
+        data = b""
+        while len(data) < file_size:
+            chunk = self.socket.recv(min(4096, file_size - len(data)))
+            if not chunk:
+                raise ConnectionError("Connection closed while receiving file data")
+            data += chunk
+        return data
+
+    def decrypt_and_verify(self, file_data, file_key, auth_key):
+        if len(file_data) < NONCE_SIZE + 32:
+            print("[CLIENT] File data too small")
+            return None
+
+        file_nonce = file_data[:NONCE_SIZE]
+        encrypted_content = file_data[NONCE_SIZE:-32]
+        file_hmac = file_data[-32:]
+
+        # Verify file integrity
+        h = hmac.HMAC(auth_key, hashes.SHA256(), backend=default_backend())
+        h.update(file_nonce + encrypted_content)
+        try:
+            h.verify(file_hmac)
+            print("[CLIENT] File integrity verified")
+        except InvalidSignature:
+            print("[CLIENT] File integrity check failed")
+            return None
+
+        # Decrypt the file content
+        cipher = Cipher(algorithms.AES(file_key), modes.CTR(file_nonce), backend=default_backend())
+        decryptor = cipher.decryptor()
+        return decryptor.update(encrypted_content) + decryptor.finalize()
+
     def receive_response(self):
         try:
             # Receive response length and encrypted response from server
             response_length = int.from_bytes(self.socket.recv(4), 'big')
-            encrypted_response = self.socket.recv(response_length)
+            
+            # Additional debugging print
+            print(f"[DEBUG] Expected response length: {response_length}")
+            
+            encrypted_response = self.recv_full(response_length)
+            
+            # Additional debugging print
+            print(f"[DEBUG] Actual encrypted response length: {len(encrypted_response)}")
+            
             nonce = encrypted_response[:NONCE_SIZE]
             ciphertext = encrypted_response[NONCE_SIZE:-32]
             received_hmac = encrypted_response[-32:]
-
+            
             # Verify HMAC for integrity
             h = hmac.HMAC(self.hmac_key, hashes.SHA256(), backend=default_backend())
             h.update(nonce + ciphertext)
             h.verify(received_hmac)
-
+            
             # Decrypt response
             cipher = Cipher(algorithms.AES(self.aes_key), modes.CTR(nonce), backend=default_backend())
             decryptor = cipher.decryptor()
             plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            
+            # Additional debugging print
+            print(f"[DEBUG] Decrypted response: {plaintext.decode('utf-8')}")
+            
             return json.loads(plaintext.decode('utf-8'))
-
+        except InvalidSignature:
+            print("[CLIENT] HMAC verification failed")
+            raise
         except Exception as e:
             print(f"[CLIENT] Error receiving response: {e}")
-            return {"status": "failed", "message": str(e)}
+            raise  # Re-raise the exception instead of returning a dictionary
 
 
 
@@ -525,8 +606,6 @@ class Client:
         self.aes_key = None
         self.hmac_key = None
         self.is_logged_in = False
-        self.session_id = None
-        self.username = None  # Clear username on logout
 
     def recv_full(self, expected_length):
         data = b""
@@ -537,31 +616,7 @@ class Client:
             data += part
         return data
 
-    def list_files(self):
-        # Remove login check to allow anonymous users to see public files
-        try:
-            response = self.send_secure_request({"command": "list_files"})
-            print("[CLIENT] List files response:", response)  # Debug line
-            if response.get("status") == "success":
-                files = response.get("files", [])
-                if not files:
-                    print("No files available for download.")
-                else:
-                    print("\nAvailable files:")
-                    print("-" * 50)
-                    for file in files:
-                        print(f"File ID: {file['file_id']}")
-                        print(f"Type: {'Public' if file.get('is_public') else 'Private'}")
-                        print(f"Downloads remaining: {'unlimited' if file['downloads_remaining'] == float('inf') else file['downloads_remaining']}")
-                        print(f"Expires in: {file['expires_in_minutes']} minutes")
-                        print("-" * 50)
-                return files
-            else:
-                print(f"Error listing files: {response.get('message', 'Unknown error')}")
-                return None
-        except Exception as e:
-            print(f"[CLIENT] Error in list_files: {e}")
-            return None
+# Client class setup remains the same
 
 if __name__ == "__main__":
     client = Client()
@@ -575,7 +630,7 @@ if __name__ == "__main__":
                 password = input("Enter password: ")
                 response = client.register(username, password)
                 message = response.get("message")
-                if message:  # Only print if message exists
+                if message:
                     print(message)
                 if response.get("status") == "success":
                     print("Registration successful. You can now login.")
@@ -611,13 +666,13 @@ if __name__ == "__main__":
                             client.is_logged_in = False
                             break
                         else:
-                            print("Invalid option. Please choose among 'upload', 'download', 'search', 'list' or 'logout':")
+                            print("Invalid option. Please choose among 'upload', 'download', 'search', 'list' or 'logout'.")
                 else:
                     print("Invalid login details.")
             elif action == "exit":
                 print("Exiting client.")
                 break
             else:
-                print("Invalid option. Please choose among 'register', 'login', list, or 'exit':")
+                print("Invalid option. Please choose among 'register', 'login', 'list', or 'exit'.")
         
         client.close()
